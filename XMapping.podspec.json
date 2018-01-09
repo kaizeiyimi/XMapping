@@ -1,0 +1,23 @@
+{
+  "name": "XMapping",
+  "version": "1.0",
+  "summary": "XMapping",
+  "homepage": "https://github.com/kaizeiyimi/XMapping",
+  "authors": "kaizei",
+  "license": {
+    "type": "MIT",
+    "file": "LICENSE"
+  },
+  "authors": {
+    "kaizei": "kaizeiyimi@126.com"
+  },
+  "platforms": {
+    "ios": "8.0"
+  },
+  "source": {
+    "git": "https://github.com/kaizeiyimi/XMapping.git",
+    "tag": "1.0"
+  },
+  "source_files": "codes/**/*.swift",
+  "requires_arc": true
+}
