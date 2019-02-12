@@ -25,7 +25,7 @@ extension Transformable {
     /// default only check type.
     public static func transform(_ fromValue: TransformOriginType) throws -> TransformTargetType {
         guard let property = fromValue as? TransformTargetType else {
-            throw Mapper.Error.typeMismatch(value: fromValue, fromType: TransformOriginType.self, toType: TransformTargetType.self)
+            throw Mapper.Error.typeMismatch(keyPath: [], value: fromValue, fromType: TransformOriginType.self, toType: TransformTargetType.self)
         }
         return property
     }
@@ -116,7 +116,7 @@ extension URL: Transformable {
         let fromValue = fromValue.removingPercentEncoding?
             .addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? fromValue
         guard let url = URL(string: fromValue) else {
-            throw Mapper.Error.transformFailed(value: fromValue, fromType: String.self, toType: URL.self)
+            throw Mapper.Error.transformFailed(keyPath: [], value: fromValue, fromType: String.self, toType: URL.self)
         }
         return url
     }
@@ -169,7 +169,7 @@ extension Date {
                 return date
             }
         }
-        throw Mapper.Error.transformFailed(value: string, fromType: String.self, toType: Date.self)
+        throw Mapper.Error.transformFailed(keyPath: [], value: string, fromType: String.self, toType: Date.self)
     }
     
     public static func transformMilliSecond(_ ms: Double) -> Date {
@@ -186,14 +186,14 @@ extension Date {
 
 /// enumeration representing server's cases should confirm to this protocol.
 /// custom your convert function if needed.
-public protocol EnumerationTransformable: RawRepresentable {
+public protocol EnumerationTransformable: RawRepresentable, Transformable {
     static func convert(rawValue: RawValue) -> Self?
 }
 
 extension EnumerationTransformable  {
     public static func transform(_ fromValue: RawValue) throws -> Self {
         guard let result = self.convert(rawValue: fromValue) else {
-            throw Mapper.Error.missingCase(value: fromValue, toType: Self.self)
+            throw Mapper.Error.missingCase(keyPath: [], value: fromValue, toType: Self.self)
         }
         return result
     }
@@ -213,7 +213,7 @@ public func compatible<A, B>(_ typeA: A.Type, _ convert: @escaping (A) throws ->
             return try convert(a)
             
         default:
-            throw Mapper.Error.transformFailed(value: value, fromType: type(of: value), toType: B.self)
+            throw Mapper.Error.transformFailed(keyPath: [], value: value, fromType: type(of: value), toType: B.self)
         }
     }
 }

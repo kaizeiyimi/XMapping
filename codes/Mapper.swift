@@ -11,24 +11,37 @@ import Foundation
 // MARK: - KeyPath
 
 /// support key & index
-public enum MappingKeyPath {
+public enum MappingKeyPath: CustomStringConvertible {
     case key(String)
     case index(Int)
+    
+    public var description: String {
+        switch self {
+        case let .key(key): return key
+        case let .index(index): return "\(index)"
+        }
+    }
 }
 
 public protocol MappingKeyPathConvertible {
-    func asMappingKeyPath() -> MappingKeyPath
+    func asMappingKeyPaths() -> [MappingKeyPath]
 }
 
 extension String: MappingKeyPathConvertible {
-    public func asMappingKeyPath() -> MappingKeyPath {
-        return .key(self)
+    public func asMappingKeyPaths() -> [MappingKeyPath] {
+        return [.key(self)]
     }
 }
 
 extension Int: MappingKeyPathConvertible {
-    public func asMappingKeyPath() -> MappingKeyPath {
-        return .index(self)
+    public func asMappingKeyPaths() -> [MappingKeyPath] {
+        return [.index(self)]
+    }
+}
+
+extension Array: MappingKeyPathConvertible where Element == MappingKeyPathConvertible {
+    public func asMappingKeyPaths() -> [MappingKeyPath] {
+        return flatMap{ $0.asMappingKeyPaths() }
     }
 }
 
@@ -39,14 +52,11 @@ public struct Mapper {
     
     /// represents errors when perform mapping.
     public enum Error: Swift.Error {
-        case typeMismatch(value: Any, fromType: Any.Type, toType: Any.Type)
-        case transformFailed(value: Any, fromType: Any.Type, toType: Any.Type)
+        case typeMismatch(keyPath: [MappingKeyPath], value: Any, fromType: Any.Type, toType: Any.Type)
+        case transformFailed(keyPath: [MappingKeyPath], value: Any, fromType: Any.Type, toType: Any.Type)
         
-        case missingField(keyPath: [Any], json: Any)
-        case missingCase(value: Any, toType: Any.Type)
-        
-        case invalidKeyPath(keyPath: [Any])
-        case invalidValue(value: Any, reason: String?)
+        case missingField(keyPath: [MappingKeyPath], json: Any)
+        case missingCase(keyPath: [MappingKeyPath], value: Any, toType: Any.Type)
     }
     
     public var json: Any
@@ -69,7 +79,7 @@ public struct Mapper {
             toValue = try transform(Mapper(json: from, context: context) as! Raw)
         } else if Raw.self == [Mapper].self {
             guard let array = from as? [Any] else {
-                throw Error.typeMismatch(value: from, fromType: type(of: from), toType: [Any].self)
+                throw Error.typeMismatch(keyPath: [], value: from, fromType: type(of: from), toType: [Any].self)
             }
             toValue = try transform(array.map{ Mapper(json: $0, context: context) } as! Raw)
         } else {
@@ -80,35 +90,37 @@ public struct Mapper {
     
     /// get **Raw** value from JSON at **keyPath**.
     /// throws invalidKeyPath, missingField or typeMismatch.
-    public func rawField(at keyPath: Any...) throws -> Any {
+    public func rawField(at keyPath: MappingKeyPathConvertible...) throws -> Any {
         var object = json
-        var components = flatten(keyPath)
-        let keyPath = components
+        var components = keyPath.asMappingKeyPaths()
         
-        try components.forEach {
-            guard ($0 is MappingKeyPathConvertible) else {
-                throw Error.invalidKeyPath(keyPath: components)
-            }
-        }
-        
+        var checkingKeyPath: [MappingKeyPath] = []
         while components.count > 0 {
             let component = components.remove(at: 0)
-            switch (component as! MappingKeyPathConvertible).asMappingKeyPath() {
+            switch component {
             case let .key(key):
                 guard let dict = object as? [String: Any] else {
-                    throw Error.typeMismatch(value: object, fromType: type(of: object), toType: [String: Any].self)
+                    throw Error.typeMismatch(keyPath: checkingKeyPath,
+                                             value: object,
+                                             fromType: type(of: object),
+                                             toType: [String: Any].self)
                 }
+                checkingKeyPath.append(component)
                 guard let next = dict[key] else {
-                    throw Error.missingField(keyPath: keyPath, json: json)
+                    throw Error.missingField(keyPath: checkingKeyPath, json: json)
                 }
                 object = next
                 
             case let .index(index):
                 guard let array = object as? [Any] else {
-                    throw Error.typeMismatch(value: object, fromType: type(of: object), toType: [Any].self)
+                    throw Error.typeMismatch(keyPath: checkingKeyPath,
+                                             value: object,
+                                             fromType: type(of: object),
+                                             toType: [Any].self)
                 }
+                checkingKeyPath.append(component)
                 guard index >= 0, index < array.count else {
-                    throw Error.missingField(keyPath: keyPath, json: json)
+                    throw Error.missingField(keyPath: checkingKeyPath, json: json)
                 }
                 object = array[index]
             }
@@ -126,47 +138,99 @@ public struct Mapper {
      `pathNullAsMissing` only checks components in keyPath, the value at keyPath is **NOT** checked.
      Thus, `NSNull` can also be fetched when `pathNullAsMissing` is true.
      */
-    public func optionalRawField(at keyPath: Any..., pathNullAsMissing: Bool = true) throws -> Any? {
+    public func optionalRawField(at keyPath: MappingKeyPathConvertible..., pathNullAsMissing: Bool = true) throws -> Any? {
         do {
             return try rawField(at: keyPath)
         } catch Error.missingField {
             return nil
-        } catch let Error.typeMismatch(_, fromType, _) where pathNullAsMissing && fromType == NSNull.self {
+        } catch let Error.typeMismatch(_, _, fromType, _) where pathNullAsMissing && fromType == NSNull.self {
             return nil
         }
     }
     
     /// get **Raw** value from JSON at **keyPath**, and peform transform to T.
     /// throws invalidKeyPath, missingField, typeMismatch.
-    public func map<Raw, T>(_ keyPath: Any..., transform: (Raw) throws -> T) throws -> T {
-        return try self.transform(try rawField(at: keyPath), transform: transform)
+    public func map<Raw, T>(_ keyPath: MappingKeyPathConvertible..., transform: (Raw) throws -> T) throws -> T {
+        let raw = try rawField(at: keyPath)
+        return try Mapper.catchTransformErrorAndFillKeyPath(keyPath) {
+            try self.transform(raw, transform: transform)
+        }
     }
     
     /// get **Raw** from JSON using **keyPath**, and perform transform to T.
     /// throws invalidKeyPath, typeMismatch.
-    public func optionalMap<Raw, T>(_ keyPath: Any..., pathNullAsMissing: Bool = true, fieldNullAsMissing: Bool = true, transform: (Raw) throws -> T) throws -> T? {
+    public func optionalMap<Raw, T>(_ keyPath: MappingKeyPathConvertible..., pathNullAsMissing: Bool = true, fieldNullAsMissing: Bool = true, transform: (Raw) throws -> T) throws -> T? {
         return try optionalRawField(at: keyPath, pathNullAsMissing: pathNullAsMissing)
-            .flatMap{
-                if fieldNullAsMissing, $0 is NSNull { return nil }
-                return try self.transform($0, transform: transform)
-        }
+            .flatMap { raw in
+                if fieldNullAsMissing, raw is NSNull { return nil }
+                return try Mapper.catchTransformErrorAndFillKeyPath(keyPath) {
+                    do {
+                        return try self.transform(raw, transform: transform)
+                    } catch let Error.missingCase(info) where info.keyPath.count == 0 && info.toType.self == T.self {
+                        return nil
+                    }
+                }
+            }
     }
     
-    public func nullableMap<Raw, T>(_ keyPath: Any..., transform: (Raw) throws -> T) throws -> Nullable<T> {
+    public func nullableMap<Raw, T>(_ keyPath: MappingKeyPathConvertible..., transform: (Raw) throws -> T) throws -> Nullable<T> {
         let raw = try rawField(at: keyPath)
         if raw is NSNull {
             return .null
         }
-        return try .some(self.transform(raw, transform: transform))
+        return try .some(
+            Mapper.catchTransformErrorAndFillKeyPath(keyPath) {
+                try self.transform(raw, transform: transform)
+            }
+        )
     }
     
-    public func optionalNullableMap<Raw, T>(_ keyPath: Any..., pathNullAsMissing: Bool = true, transform: (Raw) throws -> T) throws -> Nullable<T>? {
+    public func optionalNullableMap<Raw, T>(_ keyPath: MappingKeyPathConvertible..., pathNullAsMissing: Bool = true, transform: (Raw) throws -> T) throws -> Nullable<T>? {
         return try optionalRawField(at: keyPath, pathNullAsMissing: pathNullAsMissing)
             .flatMap{ raw in
                 if raw is NSNull {
                     return .null
                 }
-                return try .some(self.transform(raw, transform: transform))
+                let value: T? = try Mapper.catchTransformErrorAndFillKeyPath(keyPath) {
+                    do {
+                        return try self.transform(raw, transform: transform)
+                    } catch let Error.missingCase(info) where info.keyPath.count == 0 && info.toType.self == T.self {
+                        return nil
+                    }
+                }
+                return value.flatMap{ .some($0) }
+        }
+    }
+    
+    private static func catchTransformErrorAndFillKeyPath<T>(_ parentKeyPath: MappingKeyPathConvertible..., transform: () throws -> T) throws -> T {
+        do {
+            return try transform()
+        } catch let error as Mapper.Error {
+            switch error {
+            case let .typeMismatch(keyPath, value, fromType, toType):
+                throw Mapper.Error.typeMismatch(keyPath: parentKeyPath.asMappingKeyPaths() + keyPath, value: value, fromType: fromType, toType: toType)
+            case let .transformFailed(keyPath, value, fromType, toType):
+                throw Mapper.Error.transformFailed(keyPath: parentKeyPath.asMappingKeyPaths() + keyPath, value: value, fromType: fromType, toType: toType)
+            case let .missingCase(keyPath, value, toType):
+                throw Mapper.Error.missingCase(keyPath: parentKeyPath.asMappingKeyPaths() + keyPath, value: value, toType: toType)
+            case let .missingField(keyPath, json):
+                throw Mapper.Error.missingField(keyPath: parentKeyPath.asMappingKeyPaths() + keyPath, json: json)
+            }
+        }
+    }
+    
+    /// return a new transform func that maps array.
+    private static func wrapAsArrayTransform<F, T>(skipFailedItems: Bool = false, transform: @escaping (F) throws -> T) -> ([F]) throws -> [T] {
+        return { (array: [F]) throws -> [T] in
+            try array.enumerated().compactMap { (index, f: F) throws -> T? in
+                if skipFailedItems {
+                    return try? transform(f)
+                } else {
+                    return try Mapper.catchTransformErrorAndFillKeyPath([index]) {
+                        try transform(f)
+                    }
+                }
+            }
         }
     }
 }
@@ -177,48 +241,36 @@ extension Mapper {
     /// parse JSON string to JSONObject
     public static func parseJSONString(_ string: String) throws -> Any {
         guard let data = string.data(using: String.Encoding.utf8, allowLossyConversion: true) else {
-            throw Error.transformFailed(value: string, fromType: String.self, toType: Data.self)
+            throw Error.transformFailed(keyPath: [], value: string, fromType: String.self, toType: Data.self)
         }
         return try JSONSerialization.jsonObject(with: data, options: .allowFragments)
     }
     
-    /// return a new transform func that maps array.
-    public static func wrapAsArrayTransform<F, T>(skipFailedItems: Bool = false, transform: @escaping (F) throws -> T) -> ([F]) throws -> [T] {
-        return { (array: [F]) throws -> [T] in try array.flatMap { (f: F) throws -> T? in
-            if skipFailedItems {
-                return try? transform(f)
-            } else {
-                return try transform(f)
-            }
-            }
-        }
-    }
-    
     public static func cast<T>(_ from: Any, to: T.Type) throws -> T {
         guard let result = from as? T else {
-            throw Error.typeMismatch(value: from, fromType: type(of: from), toType: T.self)
+            throw Error.typeMismatch(keyPath: [], value: from, fromType: type(of: from), toType: T.self)
         }
         return result
     }
     
     public static func required<F, T>(from: F, transform: (F) throws -> T?) throws -> T {
         guard let result = try transform(from) else {
-            throw Error.transformFailed(value: from, fromType: F.self, toType: T.self)
+            throw Error.transformFailed(keyPath: [], value: from, fromType: F.self, toType: T.self)
         }
         return result
     }
     
     /// generate Mapper at keyPath. NSNull at keyPath is treated as undefined
-    public func mapper(at keyPath: Any...) throws -> Mapper {
+    public func mapper(at keyPath: MappingKeyPathConvertible...) throws -> Mapper {
         let raw = try rawField(at: keyPath)
         guard !(raw is NSNull) else {
-            throw Error.missingField(keyPath: flatten(keyPath), json: json)
+            throw Error.missingField(keyPath: keyPath.asMappingKeyPaths(), json: json)
         }
         return Mapper(json: raw, context: context)
     }
     
     /// generate Mapper at keyPath. NSNull at keyPath is treated as undefined
-    public func optionalMapper(at keyPath: Any...) throws -> Mapper? {
+    public func optionalMapper(at keyPath: MappingKeyPathConvertible...) throws -> Mapper? {
         guard let raw = try optionalRawField(at: keyPath, pathNullAsMissing: true) else {
             return nil
         }
@@ -229,111 +281,86 @@ extension Mapper {
     }
     
     /// generate Mapper at keyPath. NSNull at keyPath is treated as undefined
-    public func mapper(at keyPath: Any..., default: Any) throws -> Mapper {
-        let raw = try optionalRawField(at: keyPath, pathNullAsMissing: true) ?? `default`
-        guard !(raw is NSNull) else {
-            throw Error.missingField(keyPath: flatten(keyPath), json: json)
+    public func mapper(at keyPath: MappingKeyPathConvertible..., default: Any) throws -> Mapper {
+        var raw = try optionalRawField(at: keyPath, pathNullAsMissing: true)
+        if raw == nil || raw is NSNull {
+            raw = `default`
         }
-        return Mapper(json: raw, context: context)
+        guard !(raw is NSNull) else {
+            throw Error.missingField(keyPath: keyPath.asMappingKeyPaths(), json: json)
+        }
+        return Mapper(json: raw!, context: context)
     }
 }
 
 
 // extension Transformable
 extension Mapper {
-    public func map<P: Transformable>(_ keyPath: Any...) throws -> P where P == P.TransformTargetType {
+    public func map<P: Transformable>(_ keyPath: MappingKeyPathConvertible...) throws -> P where P == P.TransformTargetType {
         return try map(keyPath, transform: P.transform)
     }
     
-    public func map<P: Transformable>(_ keyPath: Any..., skipFailedItems: Bool = false) throws -> [P] where P == P.TransformTargetType {
+    public func map<P: Transformable>(_ keyPath: MappingKeyPathConvertible..., skipFailedItems: Bool = false) throws -> [P] where P == P.TransformTargetType {
         return try map(keyPath, transform: Mapper.wrapAsArrayTransform(skipFailedItems: skipFailedItems, transform: P.transform))
     }
     
-    public func map<P: Transformable>(_ keyPath: Any..., type: P.Type) throws -> P where P == P.TransformTargetType {
+    public func map<P: Transformable>(_ keyPath: MappingKeyPathConvertible..., type: P.Type) throws -> P where P == P.TransformTargetType {
         return try map(keyPath)
     }
     
-    public func map<P: Transformable>(_ keyPath: Any..., type: [P].Type, skipFailedItems: Bool = false) throws -> [P] where P == P.TransformTargetType {
+    public func map<P: Transformable>(_ keyPath: MappingKeyPathConvertible..., type: [P].Type, skipFailedItems: Bool = false) throws -> [P] where P == P.TransformTargetType {
         return try map(keyPath, skipFailedItems: skipFailedItems)
     }
     
-    public func optionalMap<P: Transformable>(_ keyPath: Any..., pathNullAsMissing: Bool = true, fieldNullAsMissing: Bool = true) throws -> P? where P == P.TransformTargetType {
+    public func optionalMap<P: Transformable>(_ keyPath: MappingKeyPathConvertible..., pathNullAsMissing: Bool = true, fieldNullAsMissing: Bool = true) throws -> P? where P == P.TransformTargetType {
         return try optionalMap(keyPath, pathNullAsMissing: pathNullAsMissing, fieldNullAsMissing: fieldNullAsMissing, transform: P.transform)
     }
     
-    public func optionalMap<P: Transformable>(_ keyPath: Any..., pathNullAsMissing: Bool = true, fieldNullAsMissing: Bool = true, skipFailedItems: Bool = false) throws -> [P]? where P == P.TransformTargetType {
+    public func optionalMap<P: Transformable>(_ keyPath: MappingKeyPathConvertible..., pathNullAsMissing: Bool = true, fieldNullAsMissing: Bool = true, skipFailedItems: Bool = false) throws -> [P]? where P == P.TransformTargetType {
         return try optionalMap(keyPath, pathNullAsMissing: pathNullAsMissing, fieldNullAsMissing: fieldNullAsMissing,
                                transform: Mapper.wrapAsArrayTransform(skipFailedItems: skipFailedItems, transform: P.transform))
     }
     
-    public func optionalMap<P: Transformable>(_ keyPath: Any..., type: P.Type, pathNullAsMissing: Bool = true, fieldNullAsMissing: Bool = true) throws -> P? where P == P.TransformTargetType {
+    public func optionalMap<P: Transformable>(_ keyPath: MappingKeyPathConvertible..., type: P.Type, pathNullAsMissing: Bool = true, fieldNullAsMissing: Bool = true) throws -> P? where P == P.TransformTargetType {
         return try optionalMap(keyPath, pathNullAsMissing: pathNullAsMissing, fieldNullAsMissing: fieldNullAsMissing)
     }
     
-    public func optionalMap<P: Transformable>(_ keyPath: Any..., type: [P].Type, pathNullAsMissing: Bool = true, fieldNullAsMissing: Bool = true, skipFailedItems: Bool = false) throws -> [P]? where P == P.TransformTargetType {
+    public func optionalMap<P: Transformable>(_ keyPath: MappingKeyPathConvertible..., type: [P].Type, pathNullAsMissing: Bool = true, fieldNullAsMissing: Bool = true, skipFailedItems: Bool = false) throws -> [P]? where P == P.TransformTargetType {
         return try optionalMap(keyPath, pathNullAsMissing: pathNullAsMissing, fieldNullAsMissing: fieldNullAsMissing, skipFailedItems: skipFailedItems)
-    }
-}
-
-// extension enum
-extension Mapper {
-    public func map<P: EnumerationTransformable>(_ keyPath: Any...) throws -> P {
-        return try map(keyPath, transform: P.transform)
-    }
-    
-    public func map<P: EnumerationTransformable>(_ keyPath: Any..., type: P.Type) throws -> P {
-        return try map(keyPath)
-    }
-    
-    public func optionalMap<P: EnumerationTransformable>(_ keyPath: Any..., pathNullAsMissing: Bool = true, fieldNullAsMissing: Bool = true) throws -> P? {
-        do {
-            return try optionalMap(keyPath, pathNullAsMissing: pathNullAsMissing, fieldNullAsMissing: fieldNullAsMissing, transform: P.transform)
-        } catch Error.missingCase {
-            return nil
-        }
-    }
-    
-    public func optionalMap<P: EnumerationTransformable>(_ keyPath: Any..., type: P.Type, pathNullAsMissing: Bool = true, fieldNullAsMissing: Bool = true) throws -> P? {
-        return try optionalMap(keyPath, pathNullAsMissing: pathNullAsMissing, fieldNullAsMissing: fieldNullAsMissing)
     }
 }
 
 // extension Nullable
 extension Mapper {
-    public func nullableMap<P: Transformable>(_ keyPath: Any...) throws -> Nullable<P> where P == P.TransformTargetType {
+    public func nullableMap<P: Transformable>(_ keyPath: MappingKeyPathConvertible...) throws -> Nullable<P> where P == P.TransformTargetType {
         return try nullableMap(keyPath, transform: P.transform)
     }
     
-    public func nullableMap<P: Transformable>(_ keyPath: Any..., skipFailedItems: Bool = false) throws -> Nullable<[P]> where P == P.TransformTargetType {
+    public func nullableMap<P: Transformable>(_ keyPath: MappingKeyPathConvertible..., skipFailedItems: Bool = false) throws -> Nullable<[P]> where P == P.TransformTargetType {
         return try nullableMap(keyPath, transform: Mapper.wrapAsArrayTransform(skipFailedItems: skipFailedItems, transform: P.transform))
     }
     
-    public func nullableMap<P: Transformable>(_ keyPath: Any..., type: P.Type) throws -> Nullable<P> where P == P.TransformTargetType {
+    public func nullableMap<P: Transformable>(_ keyPath: MappingKeyPathConvertible..., type: P.Type) throws -> Nullable<P> where P == P.TransformTargetType {
         return try nullableMap(keyPath)
     }
     
-    public func nullableMap<P: Transformable>(_ keyPath: Any..., type: [P].Type, skipFailedItems: Bool = false) throws -> Nullable<[P]> where P == P.TransformTargetType {
+    public func nullableMap<P: Transformable>(_ keyPath: MappingKeyPathConvertible..., type: [P].Type, skipFailedItems: Bool = false) throws -> Nullable<[P]> where P == P.TransformTargetType {
         return try nullableMap(keyPath, skipFailedItems: skipFailedItems)
     }
     
-    public func optionalNullableMap<P: Transformable>(_ keyPath: Any..., pathNullAsMissing: Bool = true) throws -> Nullable<P>? where P == P.TransformTargetType {
+    public func optionalNullableMap<P: Transformable>(_ keyPath: MappingKeyPathConvertible..., pathNullAsMissing: Bool = true) throws -> Nullable<P>? where P == P.TransformTargetType {
         return try optionalNullableMap(keyPath, pathNullAsMissing: pathNullAsMissing, transform: P.transform)
     }
     
-    public func optionalNullableMap<P: Transformable>(_ keyPath: Any..., pathNullAsMissing: Bool = true, skipFailedItems: Bool = false) throws -> Nullable<[P]>? where P == P.TransformTargetType {
+    public func optionalNullableMap<P: Transformable>(_ keyPath: MappingKeyPathConvertible..., pathNullAsMissing: Bool = true, skipFailedItems: Bool = false) throws -> Nullable<[P]>? where P == P.TransformTargetType {
         return try optionalNullableMap(keyPath, pathNullAsMissing: pathNullAsMissing, transform: Mapper.wrapAsArrayTransform(skipFailedItems: skipFailedItems, transform: P.transform))
     }
     
-    public func optionalNullableMap<P: Transformable>(_ keyPath: Any..., type: P.Type, pathNullAsMissing: Bool = true) throws -> Nullable<P>? where P == P.TransformTargetType {
+    public func optionalNullableMap<P: Transformable>(_ keyPath: MappingKeyPathConvertible..., type: P.Type, pathNullAsMissing: Bool = true) throws -> Nullable<P>? where P == P.TransformTargetType {
         return try optionalNullableMap(keyPath, pathNullAsMissing: pathNullAsMissing)
     }
     
-    public func optionalNullableMap<P: Transformable>(_ keyPath: Any..., type: [P].Type, pathNullAsMissing: Bool = true, skipFailedItems: Bool = false) throws -> Nullable<[P]>? where P == P.TransformTargetType {
+    public func optionalNullableMap<P: Transformable>(_ keyPath: MappingKeyPathConvertible..., type: [P].Type, pathNullAsMissing: Bool = true, skipFailedItems: Bool = false) throws -> Nullable<[P]>? where P == P.TransformTargetType {
         return try optionalNullableMap(keyPath, pathNullAsMissing: pathNullAsMissing, skipFailedItems: skipFailedItems)
     }
-}
-
-private func flatten(_ value: Any) -> [Any] {
-    guard let array = value as? [Any] else { return [value] }
-    return array.flatMap{ flatten($0) }
 }
